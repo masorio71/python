@@ -1,0 +1,9 @@
+streamlit
+pandas
+supabase
+openpyxl
+plotly
+toml
+numpy
+msal
+requests
