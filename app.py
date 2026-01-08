@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import toml
 import os
+import time
 import msal
 import requests
 
@@ -35,9 +36,50 @@ supabase_key_global = st.secrets.get("supabase", {}).get("key", "")
 DB_TABLE_NAME = st.secrets.get("supabase", {}).get("table_name", "eventi_importati")
 supabase = init_supabase(supabase_url_global, supabase_key_global)
 
+# --- CONFIGURATION HELPERS ---
+def get_config(key):
+    """Fetch a configuration value from the app_config table."""
+    if not supabase: return ""
+    try:
+        response = supabase.table("app_config").select("value").eq("key", key).execute()
+        if response.data and len(response.data) > 0:
+            return response.data[0]['value']
+        return ""
+    except Exception as e:
+        # Fail silently or log if table doesn't exist yet
+        return ""
+
+def update_config(key, value):
+    """Upsert a configuration value into the app_config table."""
+    if not supabase: return False
+    try:
+        supabase.table("app_config").upsert({"key": key, "value": value}).execute()
+        return True
+    except Exception as e:
+        st.error(f"Errore salvataggio config ({key}): {e}")
+        return False
+
+def get_user_role(email):
+    """
+    Fetch user role from authorized_users table.
+    Returns 'Amministratore' or 'Visitatore'.
+    """
+    if not email or not supabase:
+        return None
+    try:
+        response = supabase.table("authorized_users").select("role").eq("email", email).execute()
+        if response.data and len(response.data) > 0:
+            return response.data[0].get('role', 'Visitatore')
+        return None
+    except Exception as e:
+        return None
+
 # Funzione per la pagina di Configurazione
 def render_config_page():
     st.title("⚙️ Configurazione")
+    
+    # --- 1. CONFIGURAZIONE LOCALE (st.secrets) ---
+    st.info("Le impostazioni qui sotto sono salvate nel file locale `secrets.toml`. Servono per la connessione al DB e servizi base.")
     
     # Load current values from secrets (safe access)
     current_supabase_url = st.secrets.get("supabase", {}).get("url", "")
@@ -63,7 +105,7 @@ def render_config_page():
         client_id_input = st.text_input("Client ID", value=ms_client_id, type="password")
         client_secret_input = st.text_input("Client Secret", value=ms_client_secret, type="password")
         
-        submitted = st.form_submit_button("Salva Configurazione")
+        submitted = st.form_submit_button("Salva Configurazione Locale")
         
         if submitted:
             if not url_input or not key_input or not tmdb_input:
@@ -113,10 +155,98 @@ def render_config_page():
                     DB_TABLE_NAME = table_name_input
                     supabase = init_supabase(supabase_url_global, supabase_key_global)
                     
-                    st.success("Configurazione salvata con successo! L'applicazione si aggiornerà.")
+                    st.success("Configurazione locale salvata con successo! L'applicazione si aggiornerà.")
                     
                 except Exception as e:
                     st.error(f"Errore durante il salvataggio: {e}")
+    
+    # --- 2. INTEGRAZIONI DATABASE (app_config) ---
+    st.divider()
+    st.subheader("🔌 Integrazione Brevo (SMS)")
+    st.markdown("Queste impostazioni sono salvate nel **database** e servono per l'invio di SMS.")
+
+    # Check connection
+    if not supabase:
+        st.error("Connettiti a Supabase prima di configurare Brevo.")
+    else:
+        current_brevo_key = get_config("brevo_api_key")
+        current_sms_sender = get_config("brevo_sms_sender")
+        current_sms_list_id = get_config("brevo_sms_list_id")
+        current_sms_template = get_config("brevo_sms_template_content")
+        
+        # Row 1: API Key
+        new_brevo_key = st.text_input("Brevo API Key", value=current_brevo_key, type="password", key="brevo_key_in")
+        
+        # Row 2: Sender + List ID
+        col_sender, col_list = st.columns([3, 1])
+        with col_sender:
+             new_sms_sender = st.text_input("Nome Mittente (max 11 car.)", value=current_sms_sender, max_chars=11, help="Nome che apparirà come mittente (alfanumerico).", key="brevo_sender_in")
+        with col_list:
+             new_sms_list_id = st.text_input("ID Lista Contatti", value=current_sms_list_id, help="ID numerico lista Brevo", key="brevo_list_in")
+             
+        # Row 3: Template Content
+        new_sms_template = st.text_area("Messaggio Standard (Template)", value=current_sms_template, height=100, max_chars=160, help="Il testo che verrà inviato alla lista. Max 160 caratteri.", key="brevo_tmpl_in")
+
+        if st.button("Salva Configurazione SMS", type="primary"):
+            success = True
+            if not update_config("brevo_api_key", new_brevo_key): success = False
+            if not update_config("brevo_sms_sender", new_sms_sender): success = False
+            if not update_config("brevo_sms_list_id", new_sms_list_id): success = False
+            if not update_config("brevo_sms_template_content", new_sms_template): success = False
+            
+            if success:
+                st.success("Configurazione SMS aggiornata correttamente nel database!")
+            else:
+                st.error("Errore durante il salvataggio nel database.")
+
+        # --- TEST AREA SMS ---
+        with st.expander("🧪 Area di Test SMS", expanded=False):
+            st.info("Invia un SMS di prova usando la configurazione ATTUALE (Database).")
+            
+            # Pre-fill with template content if available
+            default_msg = current_sms_template if current_sms_template else ""
+            
+            test_phone = st.text_input("Numero Destinatario", value="+39")
+            test_message = st.text_area("Messaggio del Test", value=default_msg, max_chars=160, height=100)
+            
+            if st.button("Invia SMS di Test"):
+                # Fetch fresh config to ensure we use what's in DB
+                api_key_test = get_config("brevo_api_key")
+                sender_test = get_config("brevo_sms_sender")
+                
+                if not api_key_test:
+                    st.error("API Key mancante.")
+                elif not sender_test:
+                    st.error("Mittente mancante.")
+                elif not test_phone or len(test_phone) < 5:
+                    st.error("Numero di telefono non valido.")
+                elif not test_message:
+                    st.error("Messaggio vuoto.")
+                else:
+                    try:
+                        # Brevo SMS API Payload
+                        url = "https://api.brevo.com/v3/transactionalSMS/sms"
+                        payload = {
+                            "sender": sender_test,
+                            "recipient": test_phone,
+                            "content": test_message
+                        }
+                        headers = {
+                            "api-key": api_key_test,
+                            "Content-Type": "application/json",
+                            "accept": "application/json"
+                        }
+                        
+                        with st.spinner("Invio SMS in corso..."):
+                            response = requests.post(url, json=payload, headers=headers)
+                        
+                        if response.status_code in [200, 201]:
+                            st.success("SMS inviato con successo!")
+                            st.json(response.json())
+                        else:
+                            st.error(f"Errore Brevo ({response.status_code}): {response.text}")
+                    except Exception as e:
+                        st.error(f"Eccezione durante l'invio SMS: {e}")
 
 # Funzione per la pagina di Importazione (Logica esistente)
 def render_import_page():
@@ -162,22 +292,35 @@ def render_import_page():
                  st.error("Il file Excel non ha abbastanza colonne (richieste almeno fino alla colonna L).")
                  st.stop()
 
-            col_indices = [0, 3, 2, 5, 8, 11]
+            # Updated Indices: A(0), B(1), C(2), D(3), E(4), F(5), I(8), L(11)
+            col_indices = [0, 1, 2, 3, 4, 5, 8, 11]
             selected_columns = df_uploaded.iloc[:, col_indices].copy()
             
-            original_col_a = selected_columns.columns[0]
-            selected_columns = selected_columns.rename(columns={original_col_a: 'Data'})
-
-            if "Incasso Totale Lordo" in selected_columns.columns:
-                selected_columns = selected_columns.rename(columns={"Incasso Totale Lordo": "Incasso"})
+            # Strict Renaming
+            selected_columns.columns = [
+                'data_inizio', 'data_fine', 'Nr. Eventi', 'Titolo Evento', 'autore', 
+                'Nazionalità', 'Tot. Presenze', 'Incasso'
+            ]
             
-            selected_columns['temp_datetime'] = pd.to_datetime(selected_columns['Data'], dayfirst=True, errors='coerce')
+            # Capture temp_datetime from data_inizio to process Event/Rassegna logic correctly
+            selected_columns['temp_datetime'] = pd.to_datetime(selected_columns['data_inizio'], dayfirst=True, errors='coerce')
+
+            # Date Cleaning (No Time)
+            selected_columns['data_inizio'] = selected_columns['temp_datetime'].dt.strftime('%Y-%m-%d')
+            selected_columns['data_fine'] = pd.to_datetime(selected_columns['data_fine'], dayfirst=True, errors='coerce').dt.strftime('%Y-%m-%d')
+            
+
+            
+            # Autore Cleaning
+            selected_columns['autore'] = selected_columns['autore'].astype(str).str.strip()
+            
+            # Numeric Cleaning
+            selected_columns['Nr. Eventi'] = pd.to_numeric(selected_columns['Nr. Eventi'], errors='coerce').fillna(0).astype(int)
+            selected_columns['Tot. Presenze'] = pd.to_numeric(selected_columns['Tot. Presenze'], errors='coerce').fillna(0).astype(int)
+            selected_columns['Incasso'] = pd.to_numeric(selected_columns['Incasso'], errors='coerce').fillna(0.0)
             
             # Use shared get_evento
             selected_columns['Evento'] = selected_columns['temp_datetime'].apply(get_evento)
-
-            if "Incasso" in selected_columns.columns:
-                selected_columns["Incasso"] = pd.to_numeric(selected_columns["Incasso"], errors='coerce')
             
             # --- RASSEGNA Logic (New) ---
             def get_rassegna(row):
@@ -202,7 +345,7 @@ def render_import_page():
 
             selected_columns['RASSEGNA'] = selected_columns.apply(get_rassegna, axis=1)
 
-            event_name_col = selected_columns.columns[1]
+            event_name_col = 'Titolo Evento'
             
             def check_vos(val):
                 if not isinstance(val, str):
@@ -213,11 +356,10 @@ def render_import_page():
 
             selected_columns['VOS'] = selected_columns[event_name_col].apply(check_vos)
 
-            # Format Data and Drop temp_datetime ONLY NOW
-            selected_columns['Data'] = selected_columns['temp_datetime'].dt.strftime('%Y-%m-%d')
+            # Drop temp_datetime (Data is already set and formatted)
             selected_columns = selected_columns.drop(columns=['temp_datetime'])
             
-            cols = ['Data', 'Evento', 'VOS', 'RASSEGNA'] + [c for c in selected_columns.columns if c not in ['Data', 'Evento', 'VOS', 'RASSEGNA']]
+            cols = ['data_inizio', 'data_fine', 'Evento', 'VOS', 'RASSEGNA'] + [c for c in selected_columns.columns if c not in ['data_inizio', 'data_fine', 'Evento', 'VOS', 'RASSEGNA']]
             df_uploaded = selected_columns[cols]
 
             st.success("File caricato ed elaborato con successo!")
@@ -247,50 +389,275 @@ def render_import_page():
                     st.error("Client Supabase non inizializzato. Controlla le credenziali.")
                 else:
                     try:
-                        existing_data_response = supabase.table(DB_TABLE_NAME).select("Data", f'"{event_name_col}"').execute()
-                        existing_records = existing_data_response.data if existing_data_response.data else []
+                        # 1. Fetch Existing Data needed for Summation
+                        # We need ID to update, and current values to sum
+                        # Important: event_name_col contains the column name for the title (e.g. "Titolo Evento")
+                        response = supabase.table(DB_TABLE_NAME).select("id, data_inizio, data_fine, \"Nr. Eventi\", autore, \"Tot. Presenze\", Incasso, \"" + event_name_col + "\"").execute()
+                        existing_rows = response.data if response.data else []
                         
-                        existing_set = set()
-                        for record in existing_records:
-                            r_date = record.get('Data')
-                            r_title = record.get(event_name_col)
-                            if r_date and r_title:
-                                existing_set.add((r_date, r_title))
-                        
+                        # Map: (Titolo) -> {id, pres, inc, start_date, end_date, nr_eventi}
+                        existing_map = {}
+                        for r in existing_rows:
+                            t = r.get(event_name_col)
+                            if t:
+                                existing_map[t] = {
+                                    'id': r['id'],
+                                    'presenze': r.get('Tot. Presenze') or 0,
+                                    'incasso': r.get('Incasso') or 0.0,
+                                    'nr_eventi': r.get('Nr. Eventi') or 0,
+                                    'data_inizio': r.get('data_inizio'),
+                                    'data_fine': r.get('data_fine')
+                                }
+
                         new_records = []
+                        updated_count = 0
                         skipped_count = 0
                         
-                        for index, row in df_uploaded.iterrows():
-                            row_date = row['Data']
-                            row_title = row[event_name_col]
+                        progress_bar = st.progress(0)
+                        total_rows = len(df_uploaded)
+
+                        for i, (index, row) in enumerate(df_uploaded.iterrows()):
+                             # row_pres already numeric
+                            row_title = row['Titolo Evento']
+                            row_pres = pd.to_numeric(row.get('Tot. Presenze', 0), errors='coerce')
+                            row_pres = 0 if pd.isna(row_pres) else row_pres
                             
-                            if (row_date, row_title) in existing_set:
-                                skipped_count += 1
+                            row_inc = pd.to_numeric(row.get('Incasso', 0.0), errors='coerce')
+                            row_inc = 0.0 if pd.isna(row_inc) else row_inc
+                            
+                            key = row_title
+
+                            if key in existing_map:
+                                db_rec = existing_map[key]
+                                
+                                # --- STRICT DUPLICATE RULE ---
+                                db_start_str = str(db_rec.get('data_inizio', ''))
+                                db_end_str = str(db_rec.get('data_fine', ''))
+                                row_start_str = str(row['data_inizio'])
+                                row_end_str = str(row['data_fine'])
+                                
+                                db_pres = int(db_rec.get('presenze', 0))
+                                row_pres_val = int(row_pres)
+
+                                # If Title (key), Start, End, and Presenze match exactly -> Skip
+                                if (db_start_str == row_start_str) and \
+                                   (db_end_str == row_end_str) and \
+                                   (db_pres == row_pres_val):
+                                    skipped_count += 1
+                                    if i % 5 == 0: progress_bar.progress(min((i + 1) / total_rows, 1.0))
+                                    continue 
+
+                                # UPDATE Logic (Sum + Date Range Merge)
+                                new_pres_val = db_rec['presenze'] + row_pres
+                                new_inc_val = db_rec['incasso'] + row_inc
+                                new_ev_val = db_rec['nr_eventi'] + row.get('Nr. Eventi', 0)
+                                
+                                # Date Comparison Logic
+                                try:
+                                    db_start = pd.to_datetime(db_rec['data_inizio']).date() if db_rec['data_inizio'] else None
+                                    db_end = pd.to_datetime(db_rec['data_fine']).date() if db_rec['data_fine'] else None
+                                    
+                                    row_start = pd.to_datetime(row['data_inizio']).date()
+                                    row_end = pd.to_datetime(row['data_fine']).date()
+                                    
+                                    # Handle Start
+                                    if db_start:
+                                        final_start = min(db_start, row_start)
+                                    else:
+                                        final_start = row_start
+                                        
+                                    # Handle End
+                                    if db_end:
+                                        final_end = max(db_end, row_end)
+                                    else:
+                                        final_end = row_end
+                                        
+                                except Exception:
+                                    # Fallback
+                                    final_start = row['data_inizio']
+                                    final_end = row['data_fine']
+                                
+                                # Perform Update
+                                supabase.table(DB_TABLE_NAME).update({
+                                    "Tot. Presenze": int(new_pres_val),
+                                    "Incasso": float(new_inc_val),
+                                    "Nr. Eventi": int(new_ev_val),
+                                    "data_inizio": str(final_start),
+                                    "data_fine": str(final_end),
+                                    "autore": row['autore'] # Keeping latest author logic
+                                }).eq("id", db_rec['id']).execute()
+                                
+                                # Update local map
+                                existing_map[key]['presenze'] = new_pres_val
+                                existing_map[key]['incasso'] = new_inc_val
+                                existing_map[key]['nr_eventi'] = new_ev_val
+                                existing_map[key]['data_inizio'] = str(final_start)
+                                existing_map[key]['data_fine'] = str(final_end)
+                                
+                                updated_count += 1
                             else:
-                                new_records.append(row.to_dict())
+                                # INSERT Logic
+                                # Clean NaN for JSON
+                                clean_row = row.where(pd.notnull(row), None).to_dict()
+                                new_records.append(clean_row)
+                            
+                            # Update progress
+                            if i % 5 == 0:
+                                progress_bar.progress(min((i + 1) / total_rows, 1.0))
                         
+                        progress_bar.progress(1.0)
+
+                        # Bulk Insert New
                         if new_records:
-                            response = supabase.table(DB_TABLE_NAME).insert(new_records).execute()
-                            st.success(f"Caricamento completato! Inserite {len(new_records)} nuove righe.")
-                            if skipped_count > 0:
-                                st.warning(f"Saltate {skipped_count} righe perché già presenti nel database (duplicati Data + Titolo).")
-                        else:
-                            st.warning(f"Nessuna nuova riga da inserire. Tutte le {skipped_count} righe sono già presenti nel database.")
+                            supabase.table(DB_TABLE_NAME).insert(new_records).execute()
+                        
+                        st.success(f"Operazione completata! ✅ Inseriti: {len(new_records)} nuovi record. 🔄 Aggiornati (sommati): {updated_count} record esistenti.")
 
                     except Exception as e:
-                        error_msg = str(e)
-                        if "PGRST205" in error_msg or "Could not find the table" in error_msg:
-                            st.error(f"Errore: La tabella '{DB_TABLE_NAME}' non esiste in Supabase.")
-                            # Removed SQL helper for brevity/mismatch risk, or kept? Keeping as in original to be safe but short version in replacement logic above.
-                            st.warning("Supabase non crea automaticamente le tabelle. Controlla che la tabella esista.")
-                        else:
-                            st.error(f"Errore durante il caricamento: {e}")
-                            st.info("Nota: Assicurati che la tabella esista in Supabase e che le colonne corrispondano.")
+                        st.error(f"Errore durante l'elaborazione: {e}")
                         
         except Exception as e:
             st.error(f"Errore nella lettura del file: {e}")
     else:
         st.info("Carica un file Excel (ExportEventi) per iniziare.")
+
+    # --- SECTION NEW: ExportEventi (Top/Flop) ---
+    st.divider()
+    st.subheader("Carica file ExportEventi.xlsx (Analisi Top/Flop)")
+    
+    # --- RESET TOOL ---
+    with st.expander("⚠️ Gestione Dati Analisi (Reset)", expanded=False):
+        st.warning("Usa questo pulsante se vuoi cancellare tutte le classifiche attuali e re-importare il file da zero.")
+        if st.button("🗑️ Svuota intera tabella Analisi", type="primary", key="btn_truncate_highlights"):
+            if not supabase:
+                 st.error("DB non connesso.")
+            else:
+                try:
+                    supabase.table("eventi_highlights").delete().neq("id", 0).execute()
+                    st.success("Tabella svuotata. Ora puoi ricaricare il file Excel.")
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Errore durante lo svuotamento: {e}")
+
+    uploaded_top_flop = st.file_uploader("Scegli ExportEventi.xlsx per Analisi", type=['xlsx'], key="upload_top_flop")
+
+    if uploaded_top_flop:
+        try:
+            # Load specific sheet
+            try:
+                df_tf = pd.read_excel(uploaded_top_flop, sheet_name='export_eventi')
+            except ValueError:
+                st.error("Foglio 'export_eventi' non trovato.")
+                st.stop()
+            
+            # Logic: Col A=Data (0), Col C=Titolo (2), Col K=Ingressi (10)
+            if df_tf.shape[1] < 11:
+                st.error("Il file non ha abbastanza colonne (serve almeno Colonna K).")
+            else:
+                top_flop_data = []
+                
+                for idx, row in df_tf.iterrows():
+                    r_data = row.iloc[0]      # Col A
+                    r_titolo = row.iloc[1]    # Col B
+                    r_autore = row.iloc[2]    # Col C
+                    r_nazione = row.iloc[3]   # Col D
+                    r_ingressi = row.iloc[10] # Col K
+                    r_incasso = row.iloc[12]  # Col M (Index 12) - Incasso
+                    
+                    try:
+                        ing_val = float(r_ingressi)
+                        if pd.isna(ing_val) or ing_val <= 0: continue
+                        
+                        inc_val = 0.0
+                        try:
+                            inc_val = float(r_incasso)
+                        except:
+                            inc_val = 0.0
+                            
+                    except: continue
+                    
+                    try:
+                         d_parsed = pd.to_datetime(r_data, dayfirst=True)
+                         if pd.isna(d_parsed): continue
+                         
+                         # NEW: Extract Time string (HH:MM)
+                         time_str = d_parsed.strftime('%H:%M')
+                         
+                         # SUMMER FILTER (15/06 - 15/09)
+                         md = (d_parsed.month, d_parsed.day)
+                         if (6, 15) <= md <= (9, 15):
+                             continue # Skip summer movies
+                    except: continue
+                        
+                    top_flop_data.append({
+                        "data": d_parsed.strftime('%Y-%m-%d'),
+                        "orario": time_str,
+                        "titolo_evento": str(r_titolo).strip(),
+                        "autore": str(r_autore).strip() if pd.notna(r_autore) else "",
+                        "nazione": str(r_nazione).strip() if pd.notna(r_nazione) else "",
+                        "ingressi": int(ing_val),
+                        "incasso": float(inc_val)
+                    })
+                
+                df_clean = pd.DataFrame(top_flop_data)
+                
+                df_clean = pd.DataFrame(top_flop_data)
+                
+                if df_clean.empty:
+                    st.warning("Nessun dato valido trovato.")
+                else:
+                    st.success(f"File processato: trovate {len(df_clean)} righe valide.")
+                    
+                    # Preview Data
+                    st.subheader("Anteprima Dati (Nuovi)")
+                    st.dataframe(df_clean.head(), hide_index=True)
+
+                    # --- SAVING LOGIC (INCREMENTAL) ---
+                    st.info("Tabella destinazione: eventi_highlights (Append mode)")
+                    
+                    if st.button("💾 Carica Dati (Incrementale)", type="primary"):
+                        if not supabase:
+                            st.error("DB non connesso.")
+                        else:
+                            try:
+                                # Prepare ALL records (Let DB handle duplicates)
+                                records_payload = []
+                                
+                                for _, row in df_clean.iterrows():
+                                    records_payload.append({
+                                        "data": row['data'],
+                                        "orario": row['orario'],
+                                        "titolo_evento": row['titolo_evento'],
+                                        "autore": row['autore'],
+                                        "nazione": row['nazione'],
+                                        "ingressi": int(row['ingressi']),
+                                        "incasso": float(row['incasso']),
+                                        "categoria": "DATA", # Correct Italian column name
+                                        "proiezioni_count": 1
+                                    })
+                                
+                                # Perform UPSERT with Ignore Duplicates
+                                if records_payload:
+                                    # count='exact' helps us know if insertion happened, but upsert return is tricky with ignore.
+                                    # We trust the operation.
+                                    supabase.table("eventi_highlights").upsert(
+                                        records_payload, 
+                                        on_conflict="data, titolo_evento, orario", 
+                                        ignore_duplicates=True
+                                    ).execute()
+                                    
+                                    st.success(f"✅ Elaborazione completata! I dati sono stati uniti (Upsert). Se i numeri non tornano, prova a svuotare la tabella e ricaricare.")
+                                else:
+                                    st.warning("Nessun dato da elaborare.")
+                                
+                            except Exception as e:
+                                st.error(f"Errore DB: {e}")
+                                if "column" in str(e):
+                                    st.info("Suggerimento: Controlla che le colonne 'incasso', 'categoria' esistano.")
+
+        except Exception as e:
+            st.error(f"Errore lettura file: {e}")
 
     # --- SECTION 2: ExportTitoliFiscali ---
     st.divider()
@@ -447,132 +814,6 @@ def render_import_page():
         except Exception as e:
             st.error(f"Errore generale: {e}")
 
-    # --- VALORIZZA DB (Generi TMDB) ---
-    st.markdown("---")
-    st.subheader("Valorizza DB (Generi TMDB)")
-
-    # 1. Schema Check
-    if supabase:
-        try:
-            # Try to select the new columns to see if they exist
-            supabase.table(DB_TABLE_NAME).select("genere, tmdb_processed").limit(1).execute()
-        except Exception as e:
-            if "column" in str(e) and "does not exist" in str(e):
-                st.warning("Le colonne 'genere' e 'tmdb_processed' mancano nella tabella.")
-                st.code(f"""
-                ALTER TABLE public.{DB_TABLE_NAME} 
-                ADD COLUMN IF NOT EXISTS genere TEXT,
-                ADD COLUMN IF NOT EXISTS tmdb_processed BOOLEAN DEFAULT FALSE;
-                """, language="sql")
-            # else: ignore other errors or let them surface later
-
-    # 2. Logic Flow
-    col_btn, col_limit = st.columns([3, 1])
-    
-    with col_limit:
-        limit_options = [10, 50, 100, "TUTTI"]
-        limit_selection = st.selectbox("Righe da elaborare", limit_options, index=1) # Default 50
-
-    with col_btn:
-        st.write("") # Spacer to align with selectbox label
-        st.write("")
-        start_btn = st.button("Valorizza Database", type="primary", use_container_width=True)
-
-    if start_btn:
-        if not supabase:
-             st.error("Supabase non connesso.")
-        else:
-            tmdb_api_key = st.secrets.get("tmdb", {}).get("api_key")
-            if not tmdb_api_key:
-                st.error("API Key TMDB mancante in secrets.toml.")
-            else:
-                import requests
-                
-                # Step A: Fetch Genre Mapping
-                try:
-                    url_genres = f"https://api.themoviedb.org/3/genre/movie/list?api_key={tmdb_api_key}&language=it-IT"
-                    resp_genres = requests.get(url_genres)
-                    if resp_genres.status_code == 200:
-                        genres_data = resp_genres.json().get('genres', [])
-                        genre_map = {g['id']: g['name'] for g in genres_data}
-                    else:
-                        st.error(f"Errore TMDB Genres: {resp_genres.status_code}")
-                        genre_map = {}
-                except Exception as e:
-                    st.error(f"Eccezione TMDB Genres: {e}")
-                    genre_map = {}
-
-                if genre_map:
-                    # Step B: Select Candidates
-                    try:
-                        # Determine Limit
-                        if limit_selection == "TUTTI":
-                            fetch_limit = 1000
-                        else:
-                            fetch_limit = int(limit_selection)
-
-                        response_candidates = supabase.table(DB_TABLE_NAME)\
-                            .select("id, \"Titolo Evento\"")\
-                            .or_("tmdb_processed.is.null,tmdb_processed.eq.false")\
-                            .limit(fetch_limit)\
-                            .execute()
-                        
-                        candidates = response_candidates.data if response_candidates.data else []
-                        
-                        if not candidates:
-                            st.info("Nessun film da elaborare (tutti già processati).")
-                        else:
-                            st.info(f"Inizio elaborazione di {len(candidates)} film...")
-                            progress_bar = st.progress(0)
-                            processed_count = 0
-                            found_count = 0
-                            
-                            for i, row in enumerate(candidates):
-                                row_id = row['id']
-                                raw_title = row.get('Titolo Evento', '')
-                                
-                                # Step C: Loop & Process
-                                # Clean Title
-                                clean_title = raw_title.replace("(VOS)", "").replace("(vos)", "")
-                                import re
-                                clean_title = re.sub(r'\([^)]*\)', '', clean_title).strip()
-                                
-                                found_genres_str = None
-                                match_found = False
-                                
-                                if clean_title:
-                                    # Search API
-                                    search_url = f"https://api.themoviedb.org/3/search/movie?api_key={tmdb_api_key}&query={clean_title}&language=it-IT"
-                                    try:
-                                        search_resp = requests.get(search_url)
-                                        if search_resp.status_code == 200:
-                                            results = search_resp.json().get('results', [])
-                                            if results:
-                                                first_match = results[0]
-                                                g_ids = first_match.get('genre_ids', [])
-                                                g_names = [genre_map.get(gid) for gid in g_ids if gid in genre_map]
-                                                g_names = [gn for gn in g_names if gn] # filter Nones
-                                                
-                                                if g_names:
-                                                    found_genres_str = ", ".join(g_names)
-                                                    match_found = True
-                                    except Exception as e:
-                                        print(f"Error searching {clean_title}: {e}")
-
-                                # Update DB
-                                update_data = {"tmdb_processed": True}
-                                if match_found:
-                                    update_data["genere"] = found_genres_str
-                                    found_count += 1
-                                
-                                supabase.table(DB_TABLE_NAME).update(update_data).eq("id", row_id).execute()
-                                processed_count += 1
-                                progress_bar.progress((i + 1) / len(candidates))
-                            
-                            st.success(f"Elaborazione completata! Elaborati {processed_count} film. Generi trovati per {found_count} film.")
-                            
-                    except Exception as e:
-                        st.error(f"Errore durante l'elaborazione: {e}")
 
 # Funzione helper per le Card KPI
 def render_kpi_card(title, value, comparison_html, details, border_color="gray", prev_value=None):
@@ -612,7 +853,7 @@ def generate_mock_data(start_date, end_date):
                 presenze = int(incasso / np.random.uniform(5, 15))
                 
                 data.append({
-                    'Data': date.strftime('%Y-%m-%d'),
+                    'data_inizio': date.strftime('%Y-%m-%d'),
                     'Evento': evento_type,
                     'Incasso': incasso,
                     'Presenze': presenze,
@@ -661,9 +902,9 @@ def calculate_metrics(df):
 # Helper to get max date
 def get_latest_date():
     try:
-        res = supabase.table(DB_TABLE_NAME).select("Data").order("Data", desc=True).limit(1).execute()
+        res = supabase.table(DB_TABLE_NAME).select("data_fine").order("data_fine", desc=True).limit(1).execute()
         if res.data and len(res.data) > 0:
-            return res.data[0]['Data']
+            return res.data[0]['data_fine']
     except:
         return None
     return None
@@ -801,8 +1042,8 @@ def render_consulta_page():
             # A. Main Events Table
             response_main = supabase.table(DB_TABLE_NAME) \
                 .select("*") \
-                .gte("Data", start_date.strftime('%Y-%m-%d')) \
-                .lte("Data", end_date.strftime('%Y-%m-%d')) \
+                .gte("data_inizio", start_date.strftime('%Y-%m-%d')) \
+                .lte("data_inizio", end_date.strftime('%Y-%m-%d')) \
                 .execute()
             
             if response_main.data:
@@ -815,7 +1056,7 @@ def render_consulta_page():
             
             # Safe Initialization Main
             if st.session_state.df_main.empty:
-                st.session_state.df_main = pd.DataFrame(columns=["Data", "Titolo Evento", "Incasso", "Presenze", "Nazionalità", "evento"])
+                st.session_state.df_main = pd.DataFrame(columns=["data_inizio", "Titolo Evento", "Incasso", "Presenze", "Nazionalità", "evento", "Nr. Eventi"])
 
             # B. Detail Table (dettaglio_ingressi)
             try:
@@ -848,8 +1089,8 @@ def render_consulta_page():
                 try:
                     response_compare = supabase.table(DB_TABLE_NAME) \
                         .select("*") \
-                        .gte("Data", start_date_p2.strftime('%Y-%m-%d')) \
-                        .lte("Data", end_date_p2.strftime('%Y-%m-%d')) \
+                        .gte("data_inizio", start_date_p2.strftime('%Y-%m-%d')) \
+                        .lte("data_inizio", end_date_p2.strftime('%Y-%m-%d')) \
                         .execute()
                     
                     if response_compare.data:
@@ -862,11 +1103,11 @@ def render_consulta_page():
                     
                     # Safe Initialization Compare
                     if st.session_state.df_compare.empty:
-                        st.session_state.df_compare = pd.DataFrame(columns=["Data", "Titolo Evento", "Incasso", "Presenze", "Nazionalità", "evento"])
+                        st.session_state.df_compare = pd.DataFrame(columns=["data_inizio", "Titolo Evento", "Incasso", "Presenze", "Nazionalità", "evento", "Nr. Eventi"])
 
                 except Exception as e:
                      st.error(f"Errore recupero dati Periodo 2: {e}")
-                     st.session_state.df_compare = pd.DataFrame(columns=["Data", "Titolo Evento", "Incasso", "Presenze", "Nazionalità", "evento"])
+                     st.session_state.df_compare = pd.DataFrame(columns=["data_inizio", "Titolo Evento", "Incasso", "Presenze", "Nazionalità", "evento", "Nr. Eventi"])
 
                 # B. Detail Table (Comparison)
                 try:
@@ -897,7 +1138,7 @@ def render_consulta_page():
             
         except Exception as e:
             st.error(f"Errore durante il recupero dei dati: {e}")
-            st.session_state.df_main = pd.DataFrame(columns=["Data", "Titolo Evento", "Incasso", "Presenze", "Nazionalità", "evento"])
+            st.session_state.df_main = pd.DataFrame(columns=["data_inizio", "Titolo Evento", "Incasso", "Presenze", "Nazionalità", "evento", "Nr. Eventi"])
             st.session_state.df_compare = None
 
     # --- KPI Section ---
@@ -1030,11 +1271,20 @@ def render_consulta_page():
                 if st.checkbox("Mostra solo Versione Originale (VOS)", value=False):
                     display_df = display_df[display_df['VOS'] == True]
 
-            cols_to_drop = ['id', 'Evento', 'VOS', 'temp_datetime']
+            # 1. Hide unwanted columns
+            cols_to_drop = ['id', 'Evento', 'VOS', 'temp_datetime', 'RASSEGNA', 'tmdb_processed']
             display_df = display_df.drop(columns=[c for c in cols_to_drop if c in display_df.columns])
 
+            # 2. Reorder Columns (Autore after Title)
+            desired_order = ['Titolo Evento', 'autore', 'Nr. Eventi', 'Nazionalità', 'Tot. Presenze', 'Incasso', 'data_inizio', 'data_fine']
+            # Select only existing columns from desired_order + any others not mentioned
+            final_cols = [c for c in desired_order if c in display_df.columns] + [c for c in display_df.columns if c not in desired_order]
+            display_df = display_df[final_cols]
+
+            # 3. Rename & Format
             column_config = {
-                "Data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+                "data_inizio": st.column_config.DateColumn("Data inizio", format="DD/MM/YYYY"),
+                "data_fine": st.column_config.DateColumn("Data fine", format="DD/MM/YYYY"),
                 "Incasso": st.column_config.NumberColumn("Incasso", format="%.2f €"),
             }
             
@@ -1176,117 +1426,150 @@ def render_consulta_page():
     else:
         st.info("Seleziona le date e clicca 'ELABORA' per iniziare.")
 
-# Funzione per la pagina Utenti (Microsoft 365)
-def render_users_page():
-    st.title("👥 Utenti Microsoft 365")
-
-    # Load MS Config
+# Funzione per la pagina Utenti (RBAC Manager)
+def get_entra_users():
+    """
+    Fetch users from Microsoft Entra ID (Graph API).
+    Returns a list of dicts: {'val': email, 'label': 'Name (email)'}
+    """
+    # 1. Get Secrets
     ms_config = st.secrets.get("microsoft", {})
     CLIENT_ID = ms_config.get("client_id")
     CLIENT_SECRET = ms_config.get("client_secret")
     TENANT_ID = ms_config.get("tenant_id")
     
-    # Constants
-    REDIRECT_URI = "http://localhost:8501" 
-    SCOPE = ["User.Read", "User.ReadBasic.All"]
+    if not (CLIENT_ID and CLIENT_SECRET and TENANT_ID):
+        st.error("Missing Microsoft Credentials")
+        return []
 
-    if not CLIENT_ID or not CLIENT_SECRET or not TENANT_ID:
-        st.warning("Configurazione Microsoft mancante. Vai alla pagina 'Configurazione' nel menu laterale.")
-        return
-
-    AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
-
-    # Initialize MSAL
+    # 2. Authenticate (App Context)
+    authority = f"https://login.microsoftonline.com/{TENANT_ID}"
+    app = msal.ConfidentialClientApplication(
+        CLIENT_ID, authority=authority, client_credential=CLIENT_SECRET
+    )
+    
+    result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+    
+    if "access_token" not in result:
+        st.error(f"Graph Auth Error: {result.get('error_description')}")
+        return []
+        
+    token = result['access_token']
+    
+    # 3. Query Graph API
+    headers = {'Authorization': f'Bearer {token}'}
+    # Top 999 to get all (for now)
+    url = "https://graph.microsoft.com/v1.0/users?$select=displayName,mail,userPrincipalName&$top=999"
+    
     try:
-        app = msal.ConfidentialClientApplication(
-            CLIENT_ID, authority=AUTHORITY, client_credential=CLIENT_SECRET
-        )
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        
+        users_list = []
+        for u in data.get('value', []):
+            email = u.get('mail') or u.get('userPrincipalName')
+            name = u.get('displayName', 'No Name')
+            if email:
+                label = f"{name} ({email})"
+                users_list.append({'email': email, 'label': label})
+        
+        # Sort by Name
+        users_list.sort(key=lambda x: x['label'])
+        return users_list
+        
     except Exception as e:
-        st.error(f"Errore inizializzazione MSAL: {e}")
+        st.error(f"Graph API Error: {e}")
+        return []
+
+def render_users_page():
+    st.title("👥 Gestione Utenti (RBAC)")
+    
+    global supabase
+    if not supabase:
+        st.error("Supabase non connesso.")
         return
 
-    # Check for Auth Code in Query Params (Callback)
-    if 'code' in st.query_params:
-        code = st.query_params['code']
-        try:
-            result = app.acquire_token_by_authorization_code(
-                code, scopes=SCOPE, redirect_uri=REDIRECT_URI
+    # 1. Add New User Form
+    with st.expander("➕ Aggiungi / Autorizza Utente", expanded=True):
+        
+        # Fetch Entra Users
+        entra_users = get_entra_users()
+        
+        with st.form("add_user_form"):
+            # Select User from Graph
+            selected_user = st.selectbox(
+                "Seleziona Utente Microsoft", 
+                options=entra_users, 
+                format_func=lambda x: x['label'],
+                index=None,
+                placeholder="Cerca utente..."
             )
-            if "error" in result:
-                st.error(f"Errore Login: {result.get('error_description')}")
-            else:
-                st.session_state["ms_user"] = result.get("id_token_claims")
-                st.session_state["ms_token"] = result.get("access_token")
-                # Clear code from URL
-                st.query_params.clear()
-                st.rerun()
-        except Exception as e:
-            st.error(f"Errore durante lo scambio del token: {e}")
-
-    # Check Login State
-    if "ms_token" in st.session_state:
-        user_name = st.session_state.get('ms_user', {}).get('name', 'Utente')
-        
-        col_info, col_logout = st.columns([3, 1])
-        with col_info:
-            st.success(f"Loggato come: **{user_name}**")
-        with col_logout:
-            if st.button("Logout", type="secondary"):
-                del st.session_state["ms_token"]
-                if "ms_user" in st.session_state:
-                    del st.session_state["ms_user"]
-                st.rerun()
             
-        # Fetch Users from Graph API
-        st.subheader("Elenco Utenti Organizzazione")
-        
-        headers = {'Authorization': 'Bearer ' + st.session_state['ms_token']}
-        graph_url = "https://graph.microsoft.com/v1.0/users?$select=displayName,mail,jobTitle,id"
-        
-        with st.spinner("Caricamento utenti..."):
-            try:
-                response = requests.get(graph_url, headers=headers)
-                if response.status_code == 200:
-                    users = response.json().get('value', [])
-                    if users:
-                        df_users = pd.DataFrame(users)
-                        # Rename columns for better display
-                        df_users = df_users.rename(columns={
-                            "displayName": "Nome Visualizzato",
-                            "mail": "Email",
-                            "jobTitle": "Qualifica",
-                            "id": "ID Utente"
-                        })
-                        st.dataframe(df_users, use_container_width=True)
-                    else:
-                        st.info("Nessun utente trovato.")
+            new_role = st.selectbox("Assegna Ruolo", ["Base", "Gestione Turni", "Amministratore"])
+            
+            submitted = st.form_submit_button("Autorizza Utente")
+            if submitted:
+                if not selected_user:
+                    st.error("Seleziona un utente.")
                 else:
-                    st.error(f"Errore API Graph: {response.status_code} - {response.text}")
-            except Exception as e:
-                st.error(f"Errore richiesta: {e}")
+                    new_email = selected_user['email']
+                    try:
+                        # Upsert based on email
+                        data = {"email": new_email, "role": new_role}
+                        supabase.table("authorized_users").upsert(data, on_conflict="email").execute()
+                        st.success(f"Utente {new_email} autorizzato come {new_role}.")
+                        time.sleep(1)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Errore durante l'inserimento: {e}")
 
-    else:
-        # Show Login Button
-        st.info("Effettua il login con il tuo account Microsoft 365 per visualizzare gli utenti.")
-        auth_url = app.get_authorization_request_url(SCOPE, redirect_uri=REDIRECT_URI)
+    # 2. List Users
+    st.divider()
+    st.subheader("Utenti Autorizzati")
+    
+    try:
+        response = supabase.table("authorized_users").select("*").order("email").execute()
+        users = response.data if response.data else []
         
-        # Use HTML for a cleaner link/button look that redirects properly
-        st.markdown(f'''
-            <a href="{auth_url}" target="_self">
-                <button style="
-                    background-color: #0078D4;
-                    color: white;
-                    border: none;
-                    padding: 10px 20px;
-                    border-radius: 4px;
-                    cursor: pointer;
-                    font-weight: bold;
-                    font-family: 'Segoe UI', sans-serif;
-                ">
-                    Login con Microsoft 365
-                </button>
-            </a>
-        ''', unsafe_allow_html=True)
+        if not users:
+            st.info("Nessun utente autorizzato trovato.")
+        else:
+            # Table Header
+            c1, c2, c3 = st.columns([3, 2, 1])
+            c1.markdown("**Email**")
+            c2.markdown("**Ruolo**")
+            c3.markdown("**Azioni**")
+            
+            for user in users:
+                c1, c2, c3 = st.columns([3, 2, 1])
+                u_email = user.get('email')
+                u_role = user.get('role', 'Visitatore')
+                u_id = user.get('id') # If exists, useful for delete. If PK is email, use email.
+                
+                with c1:
+                    st.write(u_email)
+                with c2:
+                    # Badge style
+                    if u_role == 'Amministratore':
+                        st.markdown(f"<span style='background-color: #d1e7dd; color: #0f5132; padding: 2px 8px; border-radius: 4px; font-size: 0.85em;'>{u_role}</span>", unsafe_allow_html=True)
+                    else:
+                         st.markdown(f"<span style='background-color: #f8f9fa; color: #6c757d; padding: 2px 8px; border-radius: 4px; font-size: 0.85em;'>{u_role}</span>", unsafe_allow_html=True)
+                with c3:
+                    if st.button("🗑️", key=f"del_{u_email}", help=f"Rimuovi {u_email}"):
+                        try:
+                            # Delete by email logic
+                            supabase.table("authorized_users").delete().eq("email", u_email).execute()
+                            st.success("Rimosso.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Errore rimozione: {e}")
+                            
+    except Exception as e:
+        if "relation" in str(e) and "does not exist" in str(e):
+             st.warning("Tabella `authorized_users` non trovata. Creala in Supabase (colonne: email, role).")
+        else:
+             st.error(f"Errore recupero utenti: {e}")
 
 # Main App Navigation
 # Funzione per la pagina Riepiloghi
@@ -1303,7 +1586,7 @@ def render_riepiloghi_page():
         with st.spinner("Elaborazione riepiloghi in corso..."):
             # Fetch data: New column name "Tot. Presenze"
             # Note: Filter in Python if simple filter prevents proper sums, but SQL filter is better for performance
-            response = supabase.table(DB_TABLE_NAME).select('Data, "Tot. Presenze", Evento, Incasso').neq('"Tot. Presenze"', 0).not_.is_('"Tot. Presenze"', "null").execute()
+            response = supabase.table(DB_TABLE_NAME).select('data_inizio, "Tot. Presenze", Evento, Incasso').neq('"Tot. Presenze"', 0).not_.is_('"Tot. Presenze"', "null").execute()
             
             if not response.data:
                 st.warning("Nessun dato disponibile.")
@@ -1312,9 +1595,9 @@ def render_riepiloghi_page():
             df = pd.DataFrame(response.data)
             if not df.empty:
                 # Standardize column names for easier processing
-                # Map "Data" -> "data" AND "Tot. Presenze" -> "presenze"
+                # Map "data_inizio" -> "data" AND "Tot. Presenze" -> "presenze"
                 df.rename(columns={
-                    'Data': 'data', 
+                    'data_inizio': 'data', 
                     'Tot. Presenze': 'presenze',
                     'Evento': 'evento',
                     'Incasso': 'incasso'
@@ -1483,14 +1766,75 @@ def get_turni():
         st.error(f"Errore recupero turni: {e}")
         return []
 
-def add_volontario(nome, cognome, ruoli):
-    """Add a new volunteer."""
+# --- TURNAZIONI HELPERS ---
+def get_turnazioni():
+    """Fetch all turnazioni (periods)."""
+    if not supabase: return []
+    try:
+        response = supabase.table("turnazioni").select("*").order("data_inizio").execute()
+        return response.data if response.data else []
+    except Exception as e:
+        # st.error(f"Errore recupero turnazioni: {e}")
+        return []
+
+def add_turnazione(nome, start, end):
+    """Add a new turnazione."""
     if not supabase: return False
     try:
         data = {
             "nome": nome,
+            "data_inizio": start.strftime("%Y-%m-%d"),
+            "data_fine": end.strftime("%Y-%m-%d")
+        }
+        supabase.table("turnazioni").insert(data).execute()
+        return True
+    except Exception as e:
+        st.error(f"Errore aggiunta turnazione: {e}")
+        return False
+
+def update_turnazione_name(id, new_name):
+    if not supabase: return False
+    try:
+        supabase.table("turnazioni").update({"nome": new_name}).eq("id", id).execute()
+        return True
+    except Exception as e:
+        st.error(f"Errore update turnazione: {e}")
+        return False
+
+def delete_turno(id):
+    if not supabase: return False
+    try:
+        supabase.table("turni").delete().eq("id", id).execute()
+        return True
+    except Exception as e:
+        st.error(f"Errore eliminazione turno: {e}")
+        return False
+
+def update_turno_limit(id, limit):
+    if not supabase: return False
+    try:
+        supabase.table("turni").update({"max_volontari": limit}).eq("id", id).execute()
+        return True
+    except Exception as e:
+        st.error(f"Errore update limite turno: {e}")
+        return False
+
+# --- EXISTING HELPERS UPDATED ---
+
+def add_volontario(nome, cognome, ruoli):
+    """Add a new volunteer with duplicate check."""
+    if not supabase: return False
+    try:
+        # Duplicate Check
+        existing = supabase.table("volontari").select("id").ilike("nome", nome).ilike("cognome", cognome).execute()
+        if existing.data and len(existing.data) > 0:
+            st.error("Volontario già presente in archivio.")
+            return False
+            
+        data = {
+            "nome": nome,
             "cognome": cognome,
-            "ruoli": ruoli # expected array/list
+            "ruoli": ruoli 
         }
         supabase.table("volontari").insert(data).execute()
         return True
@@ -1498,21 +1842,165 @@ def add_volontario(nome, cognome, ruoli):
         st.error(f"Errore aggiunta volontario: {e}")
         return False
 
-def add_turno(data_obj, ora_str):
-    """Add a new shift."""
+def delete_volontario(vol_id):
+    """Delete a volunteer, handling FK constraints."""
+    if not supabase: return False, "DB non connesso"
+    try:
+        supabase.table("volontari").delete().eq("id", vol_id).execute()
+        return True, None
+    except Exception as e:
+        err_msg = str(e)
+        if "foreign key constraint" in err_msg.lower() or "violates foreign key" in err_msg.lower():
+            return False, "Impossibile eliminare: il volontario è assegnato a dei turni."
+        return False, f"Errore eliminazione: {err_msg}"
+
+
+
+def update_volontario_roles(vol_id, new_roles):
+    """Update roles for a volunteer."""
     if not supabase: return False
     try:
-        payload = {
-            "data": data_obj.strftime("%Y-%m-%d"),
-            "ora_inizio": ora_str,
-            # responsiabile_id, tecnico_id, volontari_ids fields will be null initially or empty
-            "volontari_ids": [] 
-        }
-        supabase.table("turni").insert(payload).execute()
+        supabase.table("volontari").update({"ruoli": new_roles}).eq("id", vol_id).execute()
         return True
     except Exception as e:
-        st.error(f"Errore aggiunta turno: {e}")
+        st.error(f"Errore aggiornamento ruoli: {e}")
         return False
+
+
+def update_turnazione_dates(id, new_start, new_end):
+    """Update dates for a period with overlap check."""
+    if not supabase: return False, "DB Error"
+    
+    # Check for overlaps
+    # Fetch all other periods
+    others = supabase.table("turnazioni").select("*").neq("id", id).execute()
+    data_list = others.data or []
+    
+    ns = new_start.strftime("%Y-%m-%d")
+    ne = new_end.strftime("%Y-%m-%d")
+    
+    for p in data_list:
+        os = p['data_inizio']
+        oe = p['data_fine']
+        # Overlap: max(start1, start2) <= min(end1, end2)
+        # Note: string comparison works for ISO dates
+        if max(ns, os) <= min(ne, oe):
+            return False, f"Sovrapposizione con '{p['nome']}'"
+
+    try:
+        supabase.table("turnazioni").update({
+            "data_inizio": ns,
+            "data_fine": ne
+        }).eq("id", id).execute()
+        return True, "Aggiornato"
+    except Exception as e:
+        return False, str(e)
+
+    except Exception as e:
+        return False, str(e)
+
+def delete_turnazione(id):
+    """Delete a period if it has no associated shifts."""
+    if not supabase: return False, "DB Error"
+    try:
+        # Check integrity
+        # Count shifts
+        shifts = supabase.table("turni").select("id", count="exact").eq("turnazione_id", id).execute()
+        # count is usually in shifts.count if count param is used, but Supabase-py might vary.
+        # Safer: checks data length if we select id
+        if shifts.data and len(shifts.data) > 0:
+             return False, "Impossibile eliminare: ci sono turni associati."
+        
+        supabase.table("turnazioni").delete().eq("id", id).execute()
+        return True, "Eliminato"
+    except Exception as e:
+        return False, str(e)
+
+def find_turnazione_for_date(date_obj):
+    """Find active turnazione for a given date."""
+    if not supabase: return None, None
+    d_str = date_obj.strftime("%Y-%m-%d")
+    try:
+        # lte = less than or equal (start <= date)
+        # gte = greater than or equal (end >= date)
+        # Supabase filter: data_inizio <= date AND data_fine >= date
+        res = supabase.table("turnazioni").select("id, nome")\
+            .lte("data_inizio", d_str)\
+            .gte("data_fine", d_str)\
+            .execute()
+        if res.data and len(res.data) > 0:
+            return res.data[0]['id'], res.data[0]['nome']
+        return None, None
+    except Exception:
+        return None, None
+
+def add_turno(data_obj, ora_str, max_volontari=2, turnazione_id=None):
+    """Add a new shift."""
+    if not supabase: return False, "DB non connesso"
+    try:
+        # Check duplicate
+        d_str = data_obj.strftime("%Y-%m-%d")
+        existing = supabase.table("turni").select("id").eq("data", d_str).eq("ora_inizio", ora_str).execute()
+        if existing.data and len(existing.data) > 0:
+            return False, "Esiste già un turno pianificato per questa data e orario."
+            
+        payload = {
+            "data": d_str,
+            "ora_inizio": ora_str,
+            "volontari_ids": [],
+            "max_volontari": max_volontari
+        }
+        if turnazione_id:
+            payload["turnazione_id"] = turnazione_id
+            
+        supabase.table("turni").insert(payload).execute()
+        return True, "Turno creato correttamente."
+    except Exception as e:
+        return False, f"Errore aggiunta turno: {e}"
+
+def send_brevo_campaign(message_text, campaign_name):
+    """
+    Send an SMS campaign via Brevo.
+    """
+    brevo_config = st.secrets.get("brevo", {})
+    api_key = brevo_config.get("api_key")
+    sender = brevo_config.get("sms_sender")
+    list_id = brevo_config.get("sms_list_id")
+
+    if not api_key:
+        return False, "API Key Brevo non configurata."
+    if not list_id:
+        return False, "ID Lista non configurato."
+    if not sender:
+        return False, "Mittente SMS non configurato."
+
+    url = "https://api.brevo.com/v3/smsCampaigns"
+    
+    # Schedule for NOW (UTC)
+    scheduled_at = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')
+
+    payload = {
+        "name": campaign_name,
+        "sender": sender,
+        "content": message_text,
+        "recipients": {"listIds": [int(list_id)]},
+        "scheduledAt": scheduled_at
+    }
+
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "api-key": api_key
+    }
+
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+        if response.status_code in [200, 201]:
+             return True, "Campagna inviata correttamente"
+        else:
+             return False, f"Errore Brevo: {response.text}"
+    except Exception as e:
+        return False, f"Errore di connessione: {e}"
 
 def update_turno_staff(turno_id, field, value):
     """
@@ -1536,318 +2024,541 @@ def render_turni_page():
         st.error("Client Supabase non inizializzato.")
         return
 
-    # --- 1. Layout Structure ---
-    col_sidebar, col_main = st.columns([1, 3])
+    # --- TABS LAYOUT ---
+    tab_vol, tab_periodi, tab_turni_list, tab_comms = st.tabs(["👥 Volontari", "📂 Turnazioni", "🗓️ Turni", "📢 Comunicazioni"])
     
-    # --- 2. Sidebar Logic (Pool Volontari) ---
-    with col_sidebar:
-        st.markdown("### 👥 Pool Volontari")
+    # --- FETCH DATA (GLOBAL SCOPE) ---
+    volontari_all = get_volontari()
+    # Sort globally for consistency in dropdowns
+    volontari_all.sort(key=lambda x: (x.get('cognome', '').lower(), x.get('nome', '').lower()))
+    
+    turni_all = get_turni()
+    
+    # Calculate Stats (on full list)
+    shift_counts = {}
+    for t in turni_all:
+         for role in ['responsabile_id', 'tecnico_id']:
+             if t.get(role): shift_counts[t[role]] = shift_counts.get(t[role], 0) + 1
+         for v_id in t.get('volontari_ids', []) or []:
+             shift_counts[v_id] = shift_counts.get(v_id, 0) + 1
+
+    # --- TAB 1: VOLONTARI ---
+    with tab_vol:
+        col_grid, col_stats = st.columns([4, 1])
         
-        # Add Button (Popover)
-        with st.popover("➕ Nuovo Volontario", use_container_width=True):
-            st.markdown("#### Aggiungi Volontario")
-            with st.form("form_new_vol"):
-                v_nome = st.text_input("Nome")
-                v_cognome = st.text_input("Cognome")
-                v_ruoli = st.multiselect("Ruoli", ["Responsabile", "Tecnico", "Volontario"], default=["Volontario"])
-                submitted_vol = st.form_submit_button("Salva")
-                if submitted_vol:
-                    if v_nome and v_cognome:
-                        if add_volontario(v_nome, v_cognome, v_ruoli):
-                            st.success("Volontario aggiunto!")
-                            st.rerun() # Refresh to show new vol
+        # --- LEFT: GRID ---
+        with col_grid:
+            c_btn, c_search = st.columns([1, 3])
+            
+            with c_btn:
+                with st.popover("➕ Nuovo Volontario", use_container_width=True):
+                    st.markdown("#### Aggiungi Volontario")
+                    with st.form("form_new_vol"):
+                        v_nome = st.text_input("Nome")
+                        v_cognome = st.text_input("Cognome")
+                        v_ruoli = st.multiselect("Ruoli", ["Responsabile", "Tecnico", "Volontario"], default=["Volontario"])
+                        submitted_vol = st.form_submit_button("Salva")
+                        if submitted_vol:
+                            if v_nome and v_cognome:
+                                if add_volontario(v_nome, v_cognome, v_ruoli):
+                                    st.success(f"Aggiunto {v_nome} {v_cognome}")
+                                    st.rerun()
+                            else:
+                                st.error("Nome e Cognome obbligatori")
+
+            with c_search:
+                search_query = st.text_input("Cerca", placeholder="🔍 Cerca per nome o cognome...", label_visibility="collapsed")
+            
+            # Data Preparation for Roles
+            unique_roles = sorted(list(set([r for v in volontari_all for r in v.get('ruoli', [])])))
+            filter_roles = st.multiselect("Filtra per Ruolo", options=unique_roles, placeholder="Seleziona ruoli per filtrare...")
+
+            # Combined Filtering Logic (AND)
+            volontari_display = []
+            q = search_query.lower() if search_query else ""
+            
+            for v in volontari_all:
+                # 1. Search Match
+                match_search = True
+                if q:
+                    if q not in v.get('nome', '').lower() and q not in v.get('cognome', '').lower():
+                        match_search = False
+                
+                # 2. Role Match
+                match_role = True
+                if filter_roles:
+                    v_roles = set(v.get('ruoli', []))
+                    if not v_roles.intersection(set(filter_roles)):
+                        match_role = False
+                
+                if match_search and match_role:
+                    volontari_display.append(v)
+
+            st.divider()
+            
+            # Grid Loop
+            cols = st.columns(3)
+            for i, v in enumerate(volontari_display):
+                v_id = v['id']
+                nome = f"{v.get('nome')} {v.get('cognome')}"
+                roles = v.get('ruoli', [])
+                count = shift_counts.get(v_id, 0)
+                
+                # Badges
+                badges = []
+                if "Responsabile" in roles: badges.append("resp")
+                if "Tecnico" in roles: badges.append("tec")
+                if "Volontario" in roles: badges.append("vol")
+                badges_str = " ".join([f"[{b}]" for b in badges]) 
+                
+                with cols[i % 3]:
+                    with st.container(border=True):
+                        c1, c2 = st.columns([3, 1])
+                        with c1:
+                            st.markdown(f"**{nome}**")
+                            st.caption(f"{badges_str} - 🎯 {count}")
+                        with c2:
+                            # Actions
+                            # Edit
+                            with st.popover("✏️"):
+                                new_roles = st.multiselect("Ruoli", ["Responsabile", "Tecnico", "Volontario"], default=roles, key=f"er_{v_id}")
+                                if st.button("Salva", key=f"sr_{v_id}"):
+                                    update_volontario_roles(v_id, new_roles)
+                                    st.rerun()
+                            # Delete
+                            with st.popover("🗑️"):
+                                st.write("Eliminare?")
+                                if st.button("Sì", key=f"dr_{v_id}", type="primary"):
+                                    ok, msg = delete_volontario(v_id)
+                                    if ok: 
+                                        st.success("Eliminato correttamente")
+                                        time.sleep(0.5)
+                                        st.rerun()
+                                    else: st.error(msg)
+        
+        # --- RIGHT: STATS ---
+        with col_stats:
+            st.markdown("##### 🏆 Top")
+            # Sort by count desc (using full list)
+            sorted_by_count = sorted(volontari_all, key=lambda x: shift_counts.get(x['id'], 0), reverse=True)
+            top_10 = sorted_by_count[:15]
+            
+            for v in top_10:
+                c = shift_counts.get(v['id'], 0)
+                if c > 0:
+                    st.write(f"**{c}** - {v.get('nome')} {v.get('cognome')[0]}.")
+    
+    # --- TAB 2: TURNAZIONI ---
+    with tab_periodi:
+        col_new, col_list = st.columns([1, 2])
+        
+        with col_new:
+            st.markdown("#### Nuova Turnazione")
+            with st.form("new_tn_form"):
+                tn_nome = st.text_input("Nome", placeholder="Es. Estate 2025")
+                tn_start = st.date_input("Inizio", value=datetime.today(), format="DD/MM/YYYY")
+                tn_end = st.date_input("Fine", value=datetime.today() + timedelta(days=60), format="DD/MM/YYYY")
+                if st.form_submit_button("Crea"):
+                    if tn_nome:
+                        add_turnazione(tn_nome, tn_start, tn_end)
+                        st.success("OK")
+                        st.rerun()
+                    else: st.error("Nome mancante")
+        
+        with col_list:
+            st.markdown("#### Elenco Periodi")
+            periodi = get_turnazioni()
+            for p in periodi:
+                with st.expander(f"{p['nome']} ({pd.to_datetime(p['data_inizio']).strftime('%d/%m/%Y')} - {pd.to_datetime(p['data_fine']).strftime('%d/%m/%Y')})"):
+                    # Edit Name
+                    new_n = st.text_input("Nome", value=p['nome'], key=f"ed_tn_{p['id']}")
+                    if st.button("Aggiorna Nome", key=f"up_tn_{p['id']}"):
+                        update_turnazione_name(p['id'], new_n)
+                        st.rerun()
+                    
+                    st.divider()
+                    
+                    # Edit Dates
+                    c_s, c_e = st.columns(2)
+                    d_s = c_s.date_input("Inizio", value=pd.to_datetime(p['data_inizio']), format="DD/MM/YYYY", key=f"ds_{p['id']}")
+                    d_e = c_e.date_input("Fine", value=pd.to_datetime(p['data_fine']), format="DD/MM/YYYY", key=f"de_{p['id']}")
+                    
+                    if st.button("Salva Date", key=f"sv_d_{p['id']}"):
+                        ok, msg = update_turnazione_dates(p['id'], d_s, d_e)
+                        if ok:
+                            st.success(msg)
+                            time.sleep(0.5)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                    
+                    # Show associated shifts count
+                    associated = [t for t in turni_all if t.get('turnazione_id') == p['id']]
+                    st.info(f"Turni associati: {len(associated)}")
+                    if associated:
+                        df_assoc = pd.DataFrame(associated)
+                        # Format date in dataframe for display if needed
+                        # st.dataframe(df_assoc[['data', 'ora_inizio', 'max_volontari']], hide_index=True)
+                        st.write(f"Ultimo turno: {get_latest_date()}") # Just a placeholder or summary
+                    
+                    # DELETE ZONE
+                    st.divider()
+                    with st.popover("🗑️ Elimina Periodo", help="Cancellazione sicura"):
+                        st.markdown(f"Eliminare **{p['nome']}**?")
+                        if st.button("Conferma", type="primary", key=f"del_tn_{p['id']}"):
+                             ok, msg = delete_turnazione(p['id'])
+                             if ok:
+                                 st.success(msg)
+                                 time.sleep(1)
+                                 st.rerun()
+                             else:
+                                 st.error(msg)
+
+    # --- TAB 3: TURNI ---
+    with tab_turni_list:
+        c_add, c_view = st.columns([1, 3])
+        
+        with c_add:
+            st.markdown("#### ➕ Nuovo Turno")
+            # Form outside 'form' to allow dynamic validation? No, usually form is better.
+            # But we need to validate date -> turnazione mapping.
+            
+            d_data = st.date_input("Data Turno", value=datetime.today(), format="DD/MM/YYYY")
+            d_ora = st.time_input("Ora Inizio", value=pd.Timestamp("21:00").time())
+            d_max = st.number_input("Max Vol", 1, 10, 2)
+            
+            # Validation
+            tid, tname = find_turnazione_for_date(d_data)
+            
+            if tid:
+                st.success(f"Associato a: **{tname}**")
+                if st.button("Crea Turno", type="primary"):
+                    success, msg = add_turno(d_data, d_ora.strftime("%H:%M"), d_max, tid)
+                    if success:
+                        st.success(msg)
+                        time.sleep(1)
+                        st.rerun()
                     else:
-                        st.error("Nome e Cognome obbligatori.")
+                        st.error(msg)
+            else:
+                st.error("⚠️ Nessuna Turnazione attiva in questa data. Crea prima il periodo.")
+                st.button("Crea Turno", disabled=True)
 
-        # Filters
-        filter_text = st.text_input("🔍 Cerca...", placeholder="Nome o cognome")
-        filter_role = st.multiselect("Mostra solo...", ["Responsabile", "Tecnico", "Volontario"])
-        
-        # Fetch Data
-        volontari = get_volontari()
-        turni_all = get_turni()
-        
-        # Calculate Shift Counts per Volunteer
-        # turni has volontari_ids (list), responsabile_id (int), tecnico_id (int)
-        shift_counts = {}
-        for t in turni_all:
-            # Responsabile
-            r_id = t.get('responsabile_id')
-            if r_id:
-                shift_counts[r_id] = shift_counts.get(r_id, 0) + 1
+        with c_view:
+            st.markdown("#### Calendario Turni")
             
-            # Tecnico
-            t_id = t.get('tecnico_id')
-            if t_id:
-                shift_counts[t_id] = shift_counts.get(t_id, 0) + 1
+            # Filter Logic
+            # show filters?
+            # List all sort by date
             
-            # Volontari List
-            for v_id in t.get('volontari_ids', []) or []:
-                 shift_counts[v_id] = shift_counts.get(v_id, 0) + 1
+            # Helper Mappings (Using volontari_all)
+            candidate_resp = [v for v in volontari_all if "Responsabile" in v.get('ruoli', [])]
+            candidate_tec = [v for v in volontari_all if "Tecnico" in v.get('ruoli', [])]
+            candidate_vol = volontari_all
+            # Maps
+            def get_n(v): return f"{v.get('nome')} {v.get('cognome')}"
+            map_r = {v['id']: get_n(v) for v in candidate_resp}
+            map_t = {v['id']: get_n(v) for v in candidate_tec}
+            map_v = {v['id']: get_n(v) for v in candidate_vol}
 
-        # Apply Filters
-        filtered_vol = []
-        for v in volontari:
-            # Search Text
-            full_name = f"{v.get('nome', '')} {v.get('cognome', '')}".lower()
-            if filter_text and filter_text.lower() not in full_name:
-                continue
-            
-            # Search Role
-            v_roles = v.get('ruoli', [])
-            if filter_role:
-                # Check if user has AT LEAST one of the selected roles
-                if not any(r in v_roles for r in filter_role):
-                    continue
-            
-            filtered_vol.append(v)
-            
-        # Display List
-        st.markdown("---")
-        for v in filtered_vol:
-            v_id = v['id']
-            nome = f"{v.get('nome')} {v.get('cognome')}"
-            roles = v.get('ruoli', [])
-            
-            # Badges
-            badges = []
-            if "Responsabile" in roles: badges.append("🟠 Resp")
-            if "Tecnico" in roles: badges.append("🟢 Tec")
-            if "Volontario" in roles: badges.append("🔵 Vol") # Optional, maybe too noisy if everyone is vol
-            
-            badges_str = " ".join(badges)
-            
-            count = shift_counts.get(v_id, 0)
-            
-            with st.container(border=True):
-                st.markdown(f"**{nome}**")
-                if badges_str:
-                    st.caption(badges_str)
-                st.write(f"🎯 {count} turni")
+            for i, turno in enumerate(turni_all): # Use enumerate for safety if needed
+                t_id = turno['id']
+                t_date = pd.to_datetime(turno['data'])
+                header = f"{t_date.strftime('%d/%m/%Y')} - {turno['ora_inizio'][:5]}"
+                
+                with st.container(border=True):
+                    # Header + Actions
+                    h1, h2, h3 = st.columns([5, 1, 1])
+                    h1.markdown(f"**{header}**")
+                    with h2:
+                         with st.popover("⚙️"):
+                            nm = st.number_input("Max", 1, 10, turno.get('max_volontari', 2), key=f"mx_{t_id}")
+                            if nm != turno.get('max_volontari', 2):
+                                update_turno_limit(t_id, nm)
+                                st.rerun()
+                    with h3:
+                        with st.popover("🗑️", help="Elimina Turno"):
+                            st.write("Confermi l'eliminazione del turno?")
+                            if st.button("Sì, Elimina", type="primary", key=f"confirm_del_turno_{t_id}"):
+                                delete_turno(t_id)
+                                st.success("Turno eliminato")
+                                st.rerun()
+                    
+                    # Slots
+                    s1, s2, s3 = st.columns(3)
+                    
+                    # 1. Responsabile (CLEANED)
+                    curr_r = turno.get('responsabile_id')
+                    # Generate a unique key using 's_r_' prefix
+                    sel_r = s1.selectbox(
+                        "🟠 Resp", 
+                        [None] + list(map_r.keys()), 
+                        format_func=lambda x: map_r[x] if x else "-", 
+                        key=f"s_r_{t_id}", 
+                        index=list(map_r.keys()).index(curr_r)+1 if curr_r in map_r else 0
+                    )
+                    if sel_r != curr_r:
+                        update_turno_staff(t_id, "responsabile_id", sel_r)
+                        st.rerun()
 
+                    # 2. Tecnico (CLEANED)
+                    curr_t = turno.get('tecnico_id')
+                    sel_t = s2.selectbox(
+                        "🟢 Tec", 
+                        [None] + list(map_t.keys()), 
+                        format_func=lambda x: map_t[x] if x else "-", 
+                        key=f"s_t_{t_id}", 
+                        index=list(map_t.keys()).index(curr_t)+1 if curr_t in map_t else 0
+                    )
+                    if sel_t != curr_t:
+                        update_turno_staff(t_id, "tecnico_id", sel_t)
+                        st.rerun()
 
-    # --- 3. Main Area Logic (Pianificazione) ---
-    with col_main:
-        st.markdown("### 🗓️ Pianificazione Turni")
-        
-        # Add Button (Popover)
-        with st.popover("➕ Nuovo Turno"):
-             st.markdown("#### Crea Nuovo Turno")
-             with st.form("form_new_shift"):
-                 d_data = st.date_input("Data", value=datetime.now())
-                 d_ora = st.time_input("Ora Inizio", value=pd.Timestamp("21:00").time())
-                 submitted_shift = st.form_submit_button("Crea Turno")
-                 if submitted_shift:
-                     if add_turno(d_data, d_ora.strftime("%H:%M")):
-                         st.success("Turno creato!")
+                    # 3. Volontari (CLEANED)
+                    row_max = turno.get('max_volontari', 2)
+                    curr_v = turno.get('volontari_ids') or []
+                    # Filter current volunteers to ensure they exist in map_v to avoid errors
+                    valid_curr_v = [x for x in curr_v if x in map_v]
+                    
+                    sel_v = s3.multiselect(
+                        f"🔵 Vol (Max {row_max})", 
+                        list(map_v.keys()), 
+                        default=valid_curr_v, 
+                        format_func=lambda x: map_v[x], 
+                        key=f"s_v_{t_id}", 
+                        max_selections=row_max
+                    )
+                    
+                    # Compare sets to detect changes (ignoring order)
+                    if set(sel_v) != set(curr_v):
+                         update_turno_staff(t_id, "volontari_ids", sel_v)
                          st.rerun()
 
-        st.markdown("---")
+    # --- TAB 4: COMUNICAZIONI ---
+    with tab_comms:
+        st.markdown("#### 📢 Comunicazioni ai Volontari")
+        st.info("Invia SMS massivi alle liste Brevo configurate.")
         
-        # Iterate Shifts
-        # Sort logic handles in get_turni (SQL order), but verify
+        # Sort periods by start date
+        periodi_sorted = sorted(get_turnazioni(), key=lambda x: x['data_inizio'])
+        brevo_list_id = st.secrets.get("brevo", {}).get("sms_list_id", "N/A")
         
-        # Helper lists for selects
-        # Responsabili: Role 'Responsabile'
-        candidate_resp = [v for v in volontari if "Responsabile" in v.get('ruoli', [])]
-        # Tecnici: Role 'Tecnico'
-        candidate_tec = [v for v in volontari if "Tecnico" in v.get('ruoli', [])]
-        # Volontari: All (or filtered?) - Spec says All
-        candidate_vol = volontari
-        
-        # Mappings for UI (ID -> Name)
-        # We need options map for Selectbox: {ID: "Name Surname"}
-        
-        def get_name(v): return f"{v.get('nome')} {v.get('cognome')}"
-
-        map_resp = {v['id']: get_name(v) for v in candidate_resp}
-        map_tec = {v['id']: get_name(v) for v in candidate_tec}
-        map_vol = {v['id']: get_name(v) for v in candidate_vol} # All
-        
-        for turno in turni_all:
-            t_id = turno['id']
-            t_date = pd.to_datetime(turno['data'])
-            t_time = turno['ora_inizio'] 
-            # Format: Venerdì 06/12/2025 - Ore 21:00
-            # Italian locale might not be everywhere, use manual day map or simple formatting
-            days_it = ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato", "Domenica"]
-            day_name = days_it[t_date.weekday()]
-            header_str = f"{day_name} {t_date.strftime('%d/%m/%Y')} - Ore {t_time[:5]}"
+        for p in periodi_sorted:
+            start_fmt = pd.to_datetime(p['data_inizio']).strftime('%d/%m/%Y')
+            end_fmt = pd.to_datetime(p['data_fine']).strftime('%d/%m/%Y')
             
-            # Container
             with st.container(border=True):
-                # Using columns for the logic slots
-                # Header
-                st.markdown(f"##### {header_str}")
-                
-                c1, c2, c3 = st.columns(3)
-                
-                # SLOT 1: RESPONSABILE
-                curr_resp = turno.get('responsabile_id')
-                with c1:
-                    sel_resp = st.selectbox(
-                        "🟠 Responsabile",
-                        options=[None] + list(map_resp.keys()),
-                        format_func=lambda x: map_resp[x] if x else "Seleziona...",
-                        key=f"resp_{t_id}",
-                        index=list(map_resp.keys()).index(curr_resp) + 1 if curr_resp in map_resp else 0
-                    )
-                    if sel_resp != curr_resp:
-                        update_turno_staff(t_id, "responsabile_id", sel_resp)
-                        st.rerun()
-                
-                # SLOT 2: TECNICO
-                curr_tec = turno.get('tecnico_id')
-                with c2:
-                    sel_tec = st.selectbox(
-                        "🟢 Tecnico",
-                        options=[None] + list(map_tec.keys()),
-                        format_func=lambda x: map_tec[x] if x else "Seleziona...",
-                        key=f"tec_{t_id}",
-                        index=list(map_tec.keys()).index(curr_tec) + 1 if curr_tec in map_tec else 0
-                    )
-                    if sel_tec != curr_tec:
-                        update_turno_staff(t_id, "tecnico_id", sel_tec)
-                        st.rerun()
-
-                # SLOT 3: VOLONTARI (Max 3)
-                curr_vols = turno.get('volontari_ids') or []
-                with c3:
-                    sel_vols = st.multiselect(
-                        "🔵 Volontari (Max 3)",
-                        options=list(map_vol.keys()),
-                        default=[v for v in curr_vols if v in map_vol], # safety filter
-                        format_func=lambda x: map_vol[x],
-                        key=f"vols_{t_id}"
-                    )
-                    
-                    if len(sel_vols) > 3:
-                        st.error("Massimo 3 volontari!")
-                        # We don't save if valid is broken? Or we save and let user fix?
-                        # Spec says "truncate or warning". Error is strictly warning.
-                        # Let's enforce truncate if we want to be strict, or just warn.
-                        # We will warn here, but if changed, we need check.
-                    
-                    # Detection of change
-                    # Sets are good for comparison independent of order
-                    if set(sel_vols) != set(curr_vols) and len(sel_vols) <= 3:
-                        update_turno_staff(t_id, "volontari_ids", sel_vols)
-                        st.rerun()
-
-                # Visual Feedback
-                has_resp = curr_resp is not None
-                has_tec = curr_tec is not None
-                has_vol = len(curr_vols) > 0
-                
-                if has_resp and has_tec and has_vol:
-                     st.success("✅ Copertura OK")
-                else:
-                     missing = []
-                     if not has_resp: missing.append("Responsabile")
-                     if not has_tec: missing.append("Tecnico")
-                     if not has_vol: missing.append("Volontari")
-                     st.warning(f"⚠️ Manca: {', '.join(missing)}")
-
+                c_info, c_act = st.columns([4, 1])
+                with c_info:
+                    st.markdown(f"**{p['nome']}** | Dal {start_fmt} Al {end_fmt}")
+                with c_act:
+                    with st.popover("✉️ Invia SMS", help="Invia messaggio alla lista Brevo"):
+                        st.markdown("##### Prepara Messaggio")
+                        default_msg = f"Ciao! La registrazione per i turni dal {start_fmt} al {end_fmt} è aperta. Accedi all'app per dare la tua disponibilità."
+                        msg_body = st.text_area("Testo Messaggio", value=default_msg, height=150, max_chars=160, key=f"msg_{p['id']}")
+                        
+                        st.caption(f"Invio alla Lista Brevo ID: **{brevo_list_id}**")
+                        
+                        if st.button(f"🚀 INVIA ORA", type="primary", key=f"snd_{p['id']}"):
+                            ok, res = send_brevo_campaign(msg_body, f"Avviso {p['nome']}")
+                            if ok:
+                                st.success(res)
+                            else:
+                                st.error(res)
 
 # Funzione per la pagina Proiezioni
 def render_proiezioni_page():
-    st.title("📽️ Proiezioni")
+    st.title("📽️ Report & Proiezioni")
 
     global supabase
     if not supabase:
         st.error("Client Supabase non inizializzato.")
         return
 
-    # Step A: Fetch All Titles
+    # --- 1. FETCH ALL DATA ---
     try:
-        # Fetch data to extract unique titles
-        # We need to query the DB. Optimally we would get distinct titles.
-        # Since we can't easily do DISTINCT query via this client, we fetch 'Titolo Evento'.
-        response = supabase.table(DB_TABLE_NAME).select('"Titolo Evento"').execute()
+        # Helper for Pagination (Bypass 1000 limit)
+        def fetch_all_highlights():
+            all_data = []
+            start = 0
+            batch_size = 1000
+            while True:
+                response = supabase.table("eventi_highlights").select('*').range(start, start + batch_size - 1).execute()
+                rows = response.data
+                if not rows:
+                    break
+                all_data.extend(rows)
+                
+                if len(rows) < batch_size:
+                    break
+                start += batch_size
+            return all_data
+
+        data_rows = fetch_all_highlights()
         
-        titles = []
-        if response.data:
-            # Extract and unique
-            _titles = set()
-            for row in response.data:
-                t = row.get('Titolo Evento')
-                if t:
-                    _titles.add(t)
-            titles = sorted(list(_titles))
+        if not data_rows:
+            st.info("Nessun dato disponibile nel report (eventi_highlights vuoto).")
+            return
             
+        df = pd.DataFrame(data_rows)
+        
+        # Ensure Numeric Types
+        df['ingressi'] = pd.to_numeric(df['ingressi'], errors='coerce').fillna(0).astype(int)
+        df['incasso'] = pd.to_numeric(df['incasso'], errors='coerce').fillna(0.0)
+        
+        # Ensure Date Type
+        df['data'] = pd.to_datetime(df['data'])
+
     except Exception as e:
-        st.error(f"Errore nel recupero dei titoli: {e}")
-        titles = []
+        st.error(f"Errore nel recupero dati: {e}")
+        return
 
-    # Step B: Search Interface (Autocomplete)
-    selected_movie = st.selectbox(
-        "Cerca Film",
-        options=titles,
-        index=None,
-        placeholder="Inizia a scrivere il nome del film..."
-    )
+    # --- HELPER FUNCTIONS ---
+    def fmt_money(val):
+        return f"€ {val:,.0f}".replace(',', '.')
+    
+    def fmt_num(val):
+        return f"{int(val):,}".replace(',', '.')
 
-    # Step C: Data Processing (On Selection)
-    if selected_movie:
+    def fmt_date_extended(d):
         try:
-            # Query specific fields
-            response_movie = supabase.table(DB_TABLE_NAME)\
-                .select('Data, "Tot. Presenze", Incasso, "Titolo Evento"')\
-                .eq('"Titolo Evento"', selected_movie)\
-                .execute()
-            
-            if response_movie.data:
-                df = pd.DataFrame(response_movie.data)
-                
-                # Normalize columns
-                # We expect: Data, Tot. Presenze, Incasso
-                
-                # Handle Presenze
-                if 'Tot. Presenze' in df.columns:
-                    df['presenze'] = pd.to_numeric(df['Tot. Presenze'], errors='coerce').fillna(0)
-                elif 'Presenze' in df.columns:
-                     df['presenze'] = pd.to_numeric(df['Presenze'], errors='coerce').fillna(0)
-                else:
-                    df['presenze'] = 0
+            days_map = {0: 'lunedì', 1: 'martedì', 2: 'mercoledì', 3: 'giovedì', 4: 'venerdì', 5: 'sabato', 6: 'domenica'}
+            return f"{days_map[d.weekday()]} {d.strftime('%d/%m/%Y')}"
+        except: return str(d)
 
-                # Handle Incasso
-                if 'Incasso' in df.columns:
-                    df['incasso'] = pd.to_numeric(df['Incasso'], errors='coerce').fillna(0)
-                else:
-                     df['incasso'] = 0
-                
-                # Handle Data
-                df['Data'] = pd.to_datetime(df['Data'])
-                
-                # Aggregates
-                unique_dates = sorted(df['Data'].dropna().unique())
-                dates_str_list = [pd.to_datetime(d).strftime('%d/%m/%Y') for d in unique_dates]
-                dates_str = ", ".join(dates_str_list)
-                
-                count_events = len(df)
-                total_presenze = int(df['presenze'].sum())
-                total_incasso = df['incasso'].sum()
-                
-                # Step D: Visualization (The Card)
-                # Using the requested style snippet
-                formatted_incasso = f"€ {total_incasso:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+    # --- 2. REPORTS SECTION (Vertical Layout) ---
+    st.subheader("📊 Classifiche Stagionali")
+    
+    tab1, tab2, tab3 = st.tabs(["🏆 Classifica Generale", "🔝 Top 10 (Singolo)", "📉 Flop 10 (Singolo)"])
+    
+    # TAB 1: CLASSIFICA GENERALE (Aggregated)
+    with tab1:
+        st.caption("Classifica basata sulla somma degli ingressi di tutte le proiezioni.")
+        
+        df_agg = df.groupby(['titolo_evento', 'autore', 'nazione']).agg({
+            'ingressi': 'sum',
+            'incasso': 'sum',
+            'data': 'min',
+            'titolo_evento': 'count' # Trick to get count, will be renamed
+        }).rename(columns={'titolo_evento': 'proiezioni_count'}).reset_index()
+        
+        # Sort & Top 10
+        df_rank = df_agg.sort_values(by='ingressi', ascending=False).head(10).copy()
+        
+        # Formatting
+        df_rank['Data*'] = df_rank['data'].apply(fmt_date_extended)
+        df_rank['Ingressi (N. Proiez.)'] = df_rank.apply(
+            lambda x: f"{fmt_num(x['ingressi'])} ({x['proiezioni_count']})", axis=1
+        )
+        df_rank['Incasso Totale'] = df_rank['incasso'].apply(fmt_money)
+        
+        st.dataframe(
+            df_rank[['titolo_evento', 'autore', 'Ingressi (N. Proiez.)', 'Incasso Totale', 'Data*', 'nazione']].rename(
+                columns={'titolo_evento': 'Film', 'autore': 'Autore', 'nazione': 'Naz.'}
+            ),
+            hide_index=True,
+            use_container_width=True
+        )
+        st.caption("(*) Si riferisce alla data della prima proiezione.")
 
-                st.markdown(f"""
-                <div style="background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-top: 20px;">
-                    <h3 style="color: #333; margin-top: 0;">{selected_movie}</h3>
-                    <hr>
-                    <p><strong>📅 Date:</strong> {dates_str}</p>
-                    <p><strong>📽️ Numero Proiezioni:</strong> {count_events}</p>
-                    <p><strong>👥 Totale Presenze:</strong> {total_presenze}</p>
-                    <p><strong>💰 Totale Incasso:</strong> {formatted_incasso}</p>
-                </div>
-                """, unsafe_allow_html=True)
-                
-            else:
-                st.info("Nessun dato trovato per il film selezionato.")
-                
-        except Exception as e:
-            st.error(f"Errore durante il recupero dei dati del film: {e}")
+    # TAB 2: TOP 10 (Single Event)
+    with tab2:
+        st.caption("I 10 singoli eventi con più spettatori.")
+        df_top = df.sort_values(by='ingressi', ascending=False).head(10).copy()
+        
+        df_top['Incasso'] = df_top['incasso'].apply(fmt_money)
+        df_top['Ingressi'] = df_top['ingressi'].apply(fmt_num)
+        df_top['Data'] = df_top['data'].apply(fmt_date_extended)
+        
+        st.dataframe(
+            df_top[['Data', 'titolo_evento', 'Ingressi', 'Incasso']].rename(
+                columns={'titolo_evento': 'Film'}
+            ),
+            hide_index=True,
+            use_container_width=True
+        )
+
+    # TAB 3: FLOP 10 (Single Event)
+    with tab3:
+        st.caption("I 10 singoli eventi con meno spettatori.")
+        df_flop = df.sort_values(by='ingressi', ascending=True).head(10).copy()
+        
+        df_flop['Incasso'] = df_flop['incasso'].apply(fmt_money)
+        df_flop['Ingressi'] = df_flop['ingressi'].apply(fmt_num)
+        df_flop['Data'] = df_flop['data'].apply(fmt_date_extended)
+        
+        st.dataframe(
+            df_flop[['Data', 'titolo_evento', 'Ingressi', 'Incasso']].rename(
+                columns={'titolo_evento': 'Film'}
+            ),
+            hide_index=True,
+            use_container_width=True
+        )
+
+    # --- 3. SEARCH SECTION (Vertical Layout - Below) ---
+    st.divider()
+    st.subheader("🔍 Cerca Film")
+    
+    # Unique titles from the DF
+    titles = sorted(df['titolo_evento'].unique())
+    
+    col_sel, col_empty = st.columns([1, 2]) # Limit selectbox width
+    with col_sel:
+        selected_movie = st.selectbox(
+            "Seleziona un titolo",
+            options=titles,
+            index=None,
+            placeholder="Scrivi per cercare...",
+            label_visibility="collapsed"
+        )
+    
+    if selected_movie:
+        # Filter Data
+        movie_data = df[df['titolo_evento'] == selected_movie]
+        
+        # Aggregates for Card
+        tot_ing = movie_data['ingressi'].sum()
+        tot_inc = movie_data['incasso'].sum()
+        n_proj = len(movie_data)
+        dates = sorted(movie_data['data'].unique())
+        dates_str = ", ".join([d.strftime('%d/%m') for d in dates])
+        
+        fmt_inc = fmt_money(tot_inc)
+        fmt_ing = fmt_num(tot_ing)
+        
+        st.markdown(f"""
+        <div style="background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); border-top: 5px solid #007bff; margin-bottom: 20px;">
+            <h3 style="margin-top:0; color: #333;">{selected_movie}</h3>
+            <p style="color: #666; font-size: 0.9em;">{dates_str}</p>
+            <hr style="margin: 10px 0;">
+            <div style="display:flex; justify-content:space-between; margin-bottom: 5px;">
+                <span>📽️ Proiezioni:</span>
+                <strong>{n_proj}</strong>
+            </div>
+            <div style="display:flex; justify-content:space-between; margin-bottom: 5px;">
+                <span>👥 Ingressi:</span>
+                <strong>{fmt_ing}</strong>
+            </div>
+            <div style="display:flex; justify-content:space-between;">
+                <span>💰 Incasso:</span>
+                <strong>{fmt_inc}</strong>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Mini Table of Screenings
+        st.markdown("**Dettaglio Proiezioni:**")
+        
+        mini_df = movie_data[['data', 'ingressi', 'incasso']].copy()
+        mini_df['data'] = mini_df['data'].apply(fmt_date_extended)
+        mini_df['incasso'] = mini_df['incasso'].apply(fmt_money)
+        mini_df['ingressi'] = mini_df['ingressi'].apply(fmt_num)
+        
+        st.dataframe(
+            mini_df.rename(columns={'data': 'Data', 'ingressi': 'Ingr.', 'incasso': 'Inc.'}),
+            hide_index=True,
+            use_container_width=True
+        )
 
 
 # Main App Navigation
@@ -1911,67 +2622,154 @@ def main():
 </style>
     """, unsafe_allow_html=True)
 
-    # 2. Sidebar Navigation
+    # --- 1. AUTHENTICATION GATEKEEPER ---
+    ms_token = st.session_state.get("ms_token")
+    
+    # MSAL Configuration
+    ms_config = st.secrets.get("microsoft", {})
+    CLIENT_ID = ms_config.get("client_id")
+    CLIENT_SECRET = ms_config.get("client_secret")
+    TENANT_ID = ms_config.get("tenant_id")
+    AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
+    REDIRECT_URI = "http://localhost:8501" 
+    SCOPE = ["User.Read", "User.ReadBasic.All"]
+
+    # Handle Callback Logic (Code Exchange) - Runs even if no token yet
+    if 'code' in st.query_params:
+         code = st.query_params['code']
+         try:
+             app = msal.ConfidentialClientApplication(CLIENT_ID, authority=AUTHORITY, client_credential=CLIENT_SECRET)
+             result = app.acquire_token_by_authorization_code(code, scopes=SCOPE, redirect_uri=REDIRECT_URI)
+             if "error" in result:
+                 st.error(result.get("error_description"))
+             else:
+                 st.session_state["ms_user"] = result.get("id_token_claims")
+                 st.session_state["ms_token"] = result.get("access_token")
+                 st.query_params.clear()
+                 st.rerun()
+         except Exception as e:
+             st.error(f"Errore Login: {e}")
+             return
+
+    if not st.session_state.get("ms_token"):
+        # RENDER LOGIN PAGE (Splash Screen)
+        c1, c2, c3 = st.columns([1, 2, 1])
+        with c2:
+            st.write("") # Spacer
+            st.write("")
+            logo_path = "assets/Logo_Metropol.png"
+            if os.path.exists(logo_path):
+                st.image(logo_path, width=200)
+            st.title("Dashboard Eventi")
+            
+            # Login Button
+            if CLIENT_ID:
+                 app = msal.ConfidentialClientApplication(CLIENT_ID, authority=AUTHORITY, client_credential=CLIENT_SECRET)
+                 auth_url = app.get_authorization_request_url(SCOPE, redirect_uri=REDIRECT_URI)
+                 # HTML Link disguised as a Button to force same-tab navigation
+                 st.markdown(f'''
+                    <a href="{auth_url}" target="_self" style="
+                        display: inline-block;
+                        padding: 0.5rem 1rem;
+                        color: white;
+                        background-color: #ff4b4b;
+                        border-radius: 0.5rem;
+                        text-decoration: none;
+                        font-weight: 500;
+                        text-align: center;
+                        width: 100%;
+                        font-family: 'Source Sans Pro', sans-serif;">
+                        🔑 Accedi con account Office 365
+                    </a>
+                 ''', unsafe_allow_html=True)
+            else:
+                st.error("Configurazione Microsoft incomplete.")
+        return # STOP EXECUTION
+
+    # --- 2. AUTHORIZATION (RBAC) ---
+    # User is Logged In
+    user_email = st.session_state.get("ms_user", {}).get("mail") or st.session_state.get("ms_user", {}).get("preferred_username")
+    user_name = st.session_state.get("ms_user", {}).get("name")
+    
+    user_role = get_user_role(user_email)
+    
+    if not user_role:
+        st.error("⛔ Accesso Negato: Utente non autorizzato.")
+        if st.button("Logout"):
+            del st.session_state["ms_token"]
+            if "ms_user" in st.session_state: del st.session_state["ms_user"]
+            st.rerun()
+        return # STOP EXECUTION
+
+    is_admin = (user_role == "Amministratore")
+
+    # --- 3. RENDER APP (AUTHORIZED) ---
+
+    # SIDEBAR
     with st.sidebar:
-        # Check for logo
-        logo_path = "assets/logo.png"
+        # Logo
+        logo_path = "assets/Logo_Metropol.png"
         if os.path.exists(logo_path):
-            st.image(logo_path, width=180)
-        else:
-            st.markdown("### Dashboard")
+            st.image(logo_path, use_container_width=True)
         
+        st.markdown("### Dashboard")
         st.markdown("---")
         
-        # Navigation with Emojis
+        # Navigation
         selected_page = st.radio(
             "Menu",
             options=["📊 Statistiche", "📑 Riepiloghi", "📽️ Proiezioni", "🗓️ Gestione Turni"],
             label_visibility="collapsed"
         )
 
-    # 3. Settings State Management
+    # SETTINGS STATE
     if "settings_view" not in st.session_state:
         st.session_state.settings_view = None
-
-    # Logic: If a settings view is active, use it. Otherwise use sidebar selection.
-    # We use a 'reset' mechanism: if user clicks sidebar, we clear settings_view.
     
-    # Check if sidebar changed (naive approach or just prioritize settings if set)
-    # Better approach: Buttons in Popover set 'settings_view'. Sidebar selection clears it? 
-    # Let's stick to the user's requested flow:
-    
-    active_view = selected_page # Default
-    
+    active_view = selected_page 
     if st.session_state.settings_view:
         active_view = st.session_state.settings_view
 
-    # 4. Top Bar (Header)
-    col_title, col_config = st.columns([6, 1])
+    # TOP BAR (Header)
+    col_title, col_config = st.columns([5, 2])
     
     with col_title:
         st.markdown(f"## {active_view}")
         
     with col_config:
-        with st.popover("⚙️", help="Impostazioni"):
-            st.markdown("**Impostazioni**")
-            if st.button("Configurazione Generale", use_container_width=True):
-                st.session_state.settings_view = "Configurazione"
-                st.rerun()
-            if st.button("Importa Dati", use_container_width=True):
-                st.session_state.settings_view = "Importa Dati"
-                st.rerun()
-            if st.button("Gestione Utenti", use_container_width=True):
-                st.session_state.settings_view = "Utenti"
-                st.rerun()
-            
-            st.divider()
-            if st.button("🔙 Torna alla Dashboard", type="primary", use_container_width=True):
-                st.session_state.settings_view = None
-                st.rerun()
+        # Display User Info & Actions
+        c_info, c_act = st.columns([2, 1])
+        with c_info:
+            st.caption(f"{user_name}\n({user_role})")
+        with c_act:
+             if st.button("Esci", key="top_logout", type="secondary"):
+                 del st.session_state["ms_token"]
+                 if "ms_user" in st.session_state: del st.session_state["ms_user"]
+                 st.session_state.settings_view = None
+                 st.rerun()
+
+        # Gear Icon (Admin Only)
+        if is_admin:
+             with st.popover("⚙️", help="Impostazioni"):
+                st.markdown("**Impostazioni**")
+                if st.button("Configurazione Generale", use_container_width=True):
+                    st.session_state.settings_view = "Configurazione"
+                    st.rerun()
+                if st.button("Importa Dati", use_container_width=True):
+                    st.session_state.settings_view = "Importa Dati"
+                    st.rerun()
+                if st.button("Gestione Utenti", use_container_width=True):
+                    st.session_state.settings_view = "Utenti"
+                    st.rerun()
+                
+                st.divider()
+                if st.button("🔙 Torna alla Dashboard", type="primary", use_container_width=True):
+                    st.session_state.settings_view = None
+                    st.rerun()
 
     st.divider()
 
-    # 5. Routing (THE FIX: Match Exact Strings)
+    # ROUTING (Strict Checks)
     if active_view == "📊 Statistiche":
         render_consulta_page()
         
@@ -1982,18 +2780,19 @@ def main():
         render_proiezioni_page()
         
     elif active_view == "🗓️ Gestione Turni":
-        render_turni_page()
+        if user_role in ['Amministratore', 'Gestione Turni']:
+            render_turni_page()
+        else:
+             st.error("⛔ Accesso non autorizzato. Contatta l'amministratore.")
         
-    # Settings Views (Plain text)
-    elif active_view == "Configurazione":
-        render_config_page()
-        
-    elif active_view == "Importa Dati":
-        render_import_page()
-        
-    elif active_view == "Utenti":
-        render_users_page()
-        
+    # Admin Pages
+    elif active_view in ["Configurazione", "Importa Dati", "Utenti"]:
+        if is_admin:
+            if active_view == "Configurazione": render_config_page()
+            elif active_view == "Importa Dati": render_import_page()
+            elif active_view == "Utenti": render_users_page()
+        else:
+            st.error("⛔ Non hai i permessi per visualizzare questa pagina.")
     else:
         st.error(f"Pagina non trovata: {active_view}")
 
