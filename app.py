@@ -2666,9 +2666,10 @@ def main():
             if CLIENT_ID:
                  app = msal.ConfidentialClientApplication(CLIENT_ID, authority=AUTHORITY, client_credential=CLIENT_SECRET)
                  auth_url = app.get_authorization_request_url(SCOPE, redirect_uri=REDIRECT_URI)
-                 # HTML Link disguised as a Button to force same-tab navigation
+                 # HTML Link disguised as a Button
+                 # target="_top" forces the link to break out of any Streamlit iframes
                  st.markdown(f'''
-                    <a href="{auth_url}" target="_self" style="
+                    <a href="{auth_url}" target="_top" style="
                         display: inline-block;
                         padding: 0.5rem 1rem;
                         color: white;
