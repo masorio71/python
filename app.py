@@ -2667,9 +2667,9 @@ def main():
                  app = msal.ConfidentialClientApplication(CLIENT_ID, authority=AUTHORITY, client_credential=CLIENT_SECRET)
                  auth_url = app.get_authorization_request_url(SCOPE, redirect_uri=REDIRECT_URI)
                  # HTML Link disguised as a Button
-                 # target="_top" forces the link to break out of any Streamlit iframes
+                 # target="_blank" is the only robust way to handle OAuth on Streamlit Cloud
                  st.markdown(f'''
-                    <a href="{auth_url}" target="_top" style="
+                    <a href="{auth_url}" target="_blank" style="
                         display: inline-block;
                         padding: 0.5rem 1rem;
                         color: white;
@@ -2680,7 +2680,7 @@ def main():
                         text-align: center;
                         width: 100%;
                         font-family: 'Source Sans Pro', sans-serif;">
-                        🔑 Accedi con account Office 365
+                        🔑 Accedi con account Office 365 (Nuova Scheda)
                     </a>
                  ''', unsafe_allow_html=True)
             else:
