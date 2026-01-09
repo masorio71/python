@@ -2631,7 +2631,25 @@ def main():
     CLIENT_SECRET = ms_config.get("client_secret")
     TENANT_ID = ms_config.get("tenant_id")
     AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
-    REDIRECT_URI = "http://localhost:8501" 
+    # --- LOGICA DINAMICA REDIRECT ---
+    # 1. Cerca 'production_uri' (Cloud)
+    # 2. Cerca 'redirect_uri' (Locale)
+    # 3. Fallback forzato a Produzione (HTTPS)
+    
+    uri_prod = ms_config.get("production_uri")
+    uri_loc = ms_config.get("redirect_uri")
+    
+    if uri_prod:
+        REDIRECT_URI = uri_prod
+    elif uri_loc:
+        REDIRECT_URI = uri_loc
+    else:
+        # Default finale per il Cloud se i secrets falliscono
+        REDIRECT_URI = "https://metropol.streamlit.app"
+        
+    # Debug visivo (solo se non loggato)
+    if "ms_token" not in st.session_state:
+        st.caption(f"Debug: Redirect impostato su {REDIRECT_URI}") 
     SCOPE = ["User.Read", "User.ReadBasic.All"]
 
     # Handle Callback Logic (Code Exchange) - Runs even if no token yet
